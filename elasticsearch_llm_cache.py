@@ -206,6 +206,39 @@ class ElasticsearchLLMCache:
 
         return embedding['inference_results'][0]['predicted_value']
 
+    def _is_similar_prompt(self, prompt_vector, threshold=0.9):
+        """
+        Check if there is an existing prompt that is similar to the new one.
+
+        :param prompt_vector: The vector representation of the new prompt.
+        :param threshold: The similarity threshold to consider a prompt as a match.
+        :return: True if a similar prompt exists, False otherwise.
+        """
+        # Search for similar vectors in the index
+        # This assumes that 'self.es' is the ElasticSearch instance and
+        # self.index_name is the name of the index
+        search_result = self.es.search(index=self.index_name, body={
+            "query": {
+                "script_score": {
+                    "query": {"match_all": {}},
+                    "script": {
+                        "source": "cosineSimilarity(params.query_vector, 'prompt_vector') + 1.0",
+                        "params": {"query_vector": prompt_vector}
+                    }
+                }
+            },
+            "size": 1  # We only need the top match
+        })
+
+        # Check if the highest scoring document meets the threshold
+        if search_result['hits']['hits']:
+            top_hit = search_result['hits']['hits'][0]
+            score = (top_hit['_score'] - 1.0) / 2.0  # Adjust score range from [1, 2] to [0, 1]
+            if score >= threshold:
+                return True
+        
+        return False
+    
     def add(self, prompt: str,
             response: str,
             source: Optional[str] = None
@@ -219,6 +252,9 @@ class ElasticsearchLLMCache:
         :return: A dictionary indicating the successful caching of the new prompt and response.
         """
         prompt_vector = self._generate_vector(prompt=prompt)
+
+        if self._is_similar_prompt(prompt_vector):
+            return {'success': False, 'error': 'A similar prompt already exists.'}
 
         doc = {
             "prompt": prompt,
