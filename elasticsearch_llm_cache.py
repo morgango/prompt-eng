@@ -55,6 +55,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from elasticsearch import Elasticsearch
 import logging
+from icecream import ic
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -79,8 +80,10 @@ class ElasticsearchLLMCache:
         self.es = es_client
         self.index_name = index_name or 'llm_cache'
         self.es_model_id = es_model_id
+        self.dims = 0
         if create_index:
             self.create_index()
+        self.msg_prompt_already_exists = 'A similar prompt already exists in the cache.'
 
     def create_index(self,
                      dims: Optional[int] = 768
@@ -108,7 +111,9 @@ class ElasticsearchLLMCache:
             }
 
             self.es.indices.create(index=self.index_name, body=mappings, ignore=400)
-            logger.info(f"Index {self.index_name} created.")
+
+            self.dims = dims
+            ic(f"Index {self.index_name} created with {self.dims} dimensions.")
 
             return {'cache_index': self.index_name, 'created_new': True}
         else:
@@ -143,6 +148,7 @@ class ElasticsearchLLMCache:
         :param create_date_gte: The date range to consider results; defaults to "now-1y/y".
         :return: A dictionary containing the hits or an empty dictionary if no hits are found.
         """
+
         knn = [
             {
                 "field": "prompt_vector",
@@ -206,17 +212,17 @@ class ElasticsearchLLMCache:
 
         return embedding['inference_results'][0]['predicted_value']
 
-    def _is_similar_prompt(self, prompt_vector, threshold=0.9):
+    def _is_similar_prompt(self, prompt, threshold=0.95, size=1):
         """
         Check if there is an existing prompt that is similar to the new one.
 
-        :param prompt_vector: The vector representation of the new prompt.
+        :param prompt: The text representation of the new prompt.
         :param threshold: The similarity threshold to consider a prompt as a match.
         :return: True if a similar prompt exists, False otherwise.
         """
-        # Search for similar vectors in the index
-        # This assumes that 'self.es' is the ElasticSearch instance and
-        # self.index_name is the name of the index
+
+        prompt_vector = self._generate_vector(prompt=prompt)
+
         search_result = self.es.search(index=self.index_name, body={
             "query": {
                 "script_score": {
@@ -227,18 +233,46 @@ class ElasticsearchLLMCache:
                     }
                 }
             },
-            "size": 1  # We only need the top match
+            "size": size  # We only need the top match
         })
 
         # Check if the highest scoring document meets the threshold
         if search_result['hits']['hits']:
-            top_hit = search_result['hits']['hits'][0]
-            score = (top_hit['_score'] - 1.0) / 2.0  # Adjust score range from [1, 2] to [0, 1]
-            if score >= threshold:
-                return True
-        
+            for hit in search_result['hits']['hits']:
+                score = float((hit['_score'] - 1.0) )
+                ic(hit['_score'], hit['_source']['prompt'], score, threshold)
+                if score >= threshold:
+                    return True
+            
         return False
-    
+
+    def list(self) -> Dict:
+
+        query = {
+            "query": {
+                "match_all": {}
+            }
+        }
+
+        # Perform the search
+        response = self.es.search(index=self.index_name, body=query)
+
+        # Extract the hits
+        hits = response['hits']['hits']
+
+        all = {}
+        count = 1
+        # Print or process the results
+        for hit in hits:
+            ic(hit['_source']['prompt'])
+            all[count] = {'prompt': hit['_source']['prompt'], \
+                          'response': hit['_source']['response'], \
+                            'create_date': hit['_source']['create_date'], \
+                                'last_hit_date': hit['_source']['last_hit_date'], }
+            count += 1
+        
+        return all
+        
     def add(self, prompt: str,
             response: str,
             source: Optional[str] = None
@@ -251,10 +285,10 @@ class ElasticsearchLLMCache:
         :param source: Optional source identifier for the LLM.
         :return: A dictionary indicating the successful caching of the new prompt and response.
         """
-        prompt_vector = self._generate_vector(prompt=prompt)
+        if self._is_similar_prompt(prompt):
+            return {'success': False, 'error': self.msg_prompt_already_exists}
 
-        if self._is_similar_prompt(prompt_vector):
-            return {'success': False, 'error': 'A similar prompt already exists.'}
+        prompt_vector = self._generate_vector(prompt=prompt)
 
         doc = {
             "prompt": prompt,
@@ -271,3 +305,86 @@ class ElasticsearchLLMCache:
             logger.error(e)
             return {'success': False,
                     'error': e}
+
+    def clear(self):
+        self.es.indices.delete(index=self.index_name)
+        # filter = ElasticsearchLLMFilter(es_client=es_client, index_name=filter_index_name, es_model_id=model_id, create_index=False)
+        # need to make sure we have the right index_name, model_id when we create the index
+        ic(self.dims, self.index_name, self.es_model_id)
+        self.create_index(dims=self.dims)
+
+    def add_bulk(self, documents: List[Dict]) -> Dict:
+        """
+        Pre-loads or "warms up" the cache with a list of documents.
+
+        :param documents: A list of dictionaries, each representing a document with 'prompt' and 'response'.
+        :return: A dictionary containing the count of successfully added, already cached, and failed documents and
+        a list of all the details of each attempt.
+        """
+        # Initialize counters for successful and already cached additions
+        success_count = 0        
+        cached_count = 0
+        cumulative_results = []
+
+        # Iterate over each document in the provided list
+        for doc in documents:
+            # Add the document using the 'add' method
+            results = self.add(prompt=doc['prompt'], response=doc['response'])
+            cumulative_results.append({'prompt': doc['prompt'], 'response': doc['response'], 'results': results})
+
+            # Increment success count if the document is successfully added
+            if results['success']:
+                success_count += 1
+            # Increment cached count if the document is already present
+            elif not results['success'] and results['error'] == self.msg_prompt_already_exists:
+                cached_count += 1
+
+        # Calculate the number of failed additions
+        failed_count = len(documents) - (success_count + cached_count)
+
+        # Return a summary of the operation
+        return {'added': success_count, 'already_cached': cached_count, 'failed': failed_count, 'details': cumulative_results}
+
+class ElasticsearchLLMFilter(ElasticsearchLLMCache):
+
+    def __init__(self,
+                 es_client: Elasticsearch,
+                 index_name: Optional[str] = None,
+                 es_model_id: Optional[str] = 'sentence-transformers__all-distilroberta-v1',
+                 create_index: bool = True
+                 ):
+        """
+        Initialize the EnhancedElasticsearchLLMCache instance.
+
+        Inherits initialization from ElasticsearchLLMCache and adds any additional initialization.
+
+        :param es_client: Elasticsearch client object.
+        :param index_name: Optional name for the index; defaults to 'llm_cache'.
+        :param es_model_id: Model ID for text embedding; defaults to 'sentence-transformers__all-distilroberta-v1'.
+        :param create_index: Boolean to determine whether to create a new index; defaults to True.
+        """
+        self.index_name = index_name or 'llm_filter'
+
+        super().__init__(es_client, index_name, es_model_id, create_index)
+
+        self.prompt_off_limits = 'This prompt is off limits and should be filtered out.'
+
+    # # Add any new methods or override existing ones
+    # def new_method(self, arg1, arg2):
+    #     # Implementation of new method
+    #     pass
+
+    def query(self,
+              prompt_text: str,
+              similarity_threshold: Optional[float] = 0.85,
+              num_candidates: Optional[int] = 1000,
+              create_date_gte: Optional[str] = "now-1y/y",
+              size=1,
+              ) -> dict:
+
+        ic(prompt_text)
+
+        candidates = self._is_similar_prompt(prompt=prompt_text, threshold=similarity_threshold, size=size)
+        # candidates = super().query(prompt_text=prompt_text, similarity_threshold=similarity_threshold, num_candidates=num_candidates, create_date_gte=create_date_gte) 
+        return candidates
+
